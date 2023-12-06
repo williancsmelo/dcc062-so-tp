@@ -111,20 +111,22 @@ int myFSCloseDir (int fd) {
 //o sistema de arquivos tenha sido registrado com sucesso.
 //Caso contrario, retorna -1
 int installMyFS (void) {
-	FSInfo myfs;
-	myfs.fsid = "myfs";
-	myfs.fsname = "Willian FS";
-	myfs.isidleFn = myFSIsIdle;
-	myfs.formatFn = myFSFormat;
-	myfs.openFn = myFSOpen;
-	myfs.readFn = myFSRead;
-	myfs.writeFn = myFSWrite;
-	myfs.closeFn = myFSClose;
-	myfs.opendirFn = myFSOpenDir;
-	myfs.readdirFn = myFSReadDir;
-	myfs.linkFn = myFSLink;
-	myfs.unlinkFn = myFSUnlink;
-	myfs.closedirFn = myFSCloseDir;
+	FSInfo *myfs = (FSInfo *)malloc(sizeof(FSInfo));
+	myfs->fsid = 'A';
+	myfs->fsname = "WillianFS";
+	myfs->isidleFn = myFSIsIdle;
+	myfs->formatFn = myFSFormat;
+	myfs->openFn = myFSOpen;
+	myfs->readFn = myFSRead;
+	myfs->writeFn = myFSWrite;
+	myfs->closeFn = myFSClose;
+	myfs->opendirFn = myFSOpenDir;
+	myfs->readdirFn = myFSReadDir;
+	myfs->linkFn = myFSLink;
+	myfs->unlinkFn = myFSUnlink;
+	myfs->closedirFn = myFSCloseDir;
 
-	return vfsRegisterFS(&myfs);
+ 	int result = vfsRegisterFS(myfs);
+	// free(myfs);
+	return result;
 }

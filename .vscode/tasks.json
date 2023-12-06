@@ -10,8 +10,7 @@
           "mkdir build;",
           "cd build;",
           "gcc -c ../*.c;",
-          " gcc -o main.exe *.o;",
-          "./main.exe"
+          "gcc *.o -o main;"
         ]
       },
       "options": {
@@ -21,6 +20,27 @@
       "group": {
         "kind": "build",
         "isDefault": true
+      }
+    },
+    {
+      "label": "compile and run",
+      "type": "shell",
+      "windows": {
+        "command": [
+          "rm build -r -ErrorAction:SilentlyContinue;",
+          "mkdir build;",
+          "cd build;",
+          "gcc -c ../*.c;",
+          "gcc *.o -o main;",
+          "./main.exe"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build"
       }
     }
   ]
