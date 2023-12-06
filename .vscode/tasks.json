@@ -10,8 +10,8 @@
           "mkdir build;",
           "cd build;",
           "gcc -c ../*.c;",
-          " gcc -o ../main.exe *.o;",
-          "../main.exe"
+          " gcc -o main.exe *.o;",
+          "./main.exe"
         ]
       },
       "options": {
