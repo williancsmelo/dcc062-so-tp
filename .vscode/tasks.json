@@ -6,15 +6,13 @@
       "type": "shell",
       "windows": {
         "command": [
-          "rm build -r -ErrorAction:SilentlyContinue;",
-          "mkdir build;",
-          "cd build;",
+          "rm './*.{exe,o}' -r -ErrorAction:SilentlyContinue;",
           "gcc -c ../*.c;",
           "gcc *.o -o main;"
         ]
       },
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}/build"
       },
       "problemMatcher": [],
       "group": {
@@ -27,16 +25,14 @@
       "type": "shell",
       "windows": {
         "command": [
-          "rm build -r -ErrorAction:SilentlyContinue;",
-          "mkdir build;",
-          "cd build;",
+          "rm './*.{exe,o}' -r -ErrorAction:SilentlyContinue;",
           "gcc -c ../*.c;",
           "gcc *.o -o main;",
           "./main.exe"
         ]
       },
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}/build"
       },
       "problemMatcher": [],
       "group": {
