@@ -28,7 +28,7 @@
           "rm './*.{exe,o}' -r -ErrorAction:SilentlyContinue;",
           "gcc -c ../*.c;",
           "gcc *.o -o main;",
-          "./main.exe"
+          "./main.exe 64.dsk"
         ]
       },
       "options": {

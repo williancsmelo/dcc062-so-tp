@@ -10,42 +10,209 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "myfs.h"
 #include "vfs.h"
 #include "inode.h"
 #include "util.h"
 
 // Declaracoes globais
-#define MAX_FILES 100
+#define ROOT_INODE_NUMBER 1
+#define NUMBLOCKS_PERINODE 8
+
+// superbloco
+#define SUPERBLOCK_SECTOR 0
+#define SUPERBLOCK_SIZE 3 // Tamanho do superbloco em numero de unsigned ints
+#define SUPERBLOCK_ITEM_BLOCKSIZE 0
+#define SUPERBLOCK_ITEM_NUMBLOCKS 1
+#define SUPERBLOCK_ITEM_NUMINODES 2
+
+// bitmap
+#define BITMAP_SECTOR 1
+
+// Funções do superbloco
+unsigned int superblock[SUPERBLOCK_SIZE];
+int saveSuperblock(Disk *d)
+{
+	unsigned char sector[DISK_SECTORDATASIZE];
+	for (int a = 0; a < SUPERBLOCK_SIZE; a++)
+		ul2char(superblock[a], &sector[a * sizeof(unsigned int)]);
+	diskWriteSector(d, SUPERBLOCK_SECTOR, sector);
+	return 0;
+}
+
+int loadSuperblock(Disk *d)
+{
+	unsigned char sector[DISK_SECTORDATASIZE];
+	if (diskReadSector(d, SUPERBLOCK_SECTOR, sector) == -1)
+		return -1;
+	for (int a = 0; a < SUPERBLOCK_SIZE; a++)
+		char2ul(&sector[a * sizeof(unsigned int)], &(superblock[a]));
+	return 0;
+}
+
+// funções do bitmap
+char *bitmap; // tamanho = numero de blocos | 1 = ocupado, 0 = livre
+
+int findFreeBlocks(unsigned int numBlocks, unsigned int *blocks)
+{
+	unsigned int freeBlocks = 0;
+	for (unsigned int i = 0; i < superblock[SUPERBLOCK_ITEM_NUMBLOCKS]; i++)
+	{
+		if (!bitmap[i])
+		{
+			blocks[freeBlocks] = i;
+			freeBlocks++;
+			if (freeBlocks == numBlocks)
+				return 0;
+		}
+	}
+	return -1;
+}
+
+int setBlocksStatus(unsigned int numBlocks, unsigned int *blocks, char status)
+{
+	if (status != 0 && status != 1)
+		return -1;
+	for (unsigned int i = 0; i < numBlocks; i++)
+		bitmap[blocks[i]] = status;
+	return 0;
+}
+
+// funções do diretório
+typedef struct directoryEntry
+{
+	char name[MAX_FILENAME_LENGTH];
+	unsigned int inodeNumber;
+} DirectoryEntry;
+
+typedef struct directory
+{
+	DirectoryEntry *entries;
+	unsigned int numEntries;
+} Directory;
+
+void addDirectoryEntry(Directory *dir, char *name, unsigned int inodeNumber)
+{
+	DirectoryEntry *entry = malloc(sizeof(DirectoryEntry));
+	strcpy(entry->name, name);
+	entry->inodeNumber = inodeNumber;
+	dir->entries[dir->numEntries] = *entry;
+	dir->numEntries++;
+}
+
+Directory *createDirectory()
+{
+	Directory *dir = malloc(sizeof(Directory));
+	dir->numEntries = 0;
+	addDirectoryEntry(dir, ".", 1);
+	return dir;
+}
+
+int saveDirectory(Disk *d, Directory *dir, Inode *inode)
+{
+	unsigned int directorySize = (dir->numEntries * sizeof(DirectoryEntry)) + sizeof(unsigned int);
+	unsigned int numBlocks = ceil((double)directorySize / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int *blocks = malloc(numBlocks * sizeof(unsigned int));
+	if (findFreeBlocks(numBlocks, blocks) == -1)
+		return -1;
+	char *buffer = malloc(numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int offset = sizeof(unsigned int);
+	ul2char(dir->numEntries, &buffer[0]);
+	for (unsigned int i = 0; i < dir->numEntries; i++)
+	{
+		ul2char(dir->entries[i].inodeNumber, &buffer[offset]);
+		offset += sizeof(unsigned int);
+		memcpy(&buffer[offset], dir->entries[i].name, MAX_FILENAME_LENGTH);
+		offset += MAX_FILENAME_LENGTH;
+	}
+	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	for (unsigned int i = 0; i < numBlocks; i++)
+	{
+		unsigned int firstSector = blocks[i] * sectorPerBlock;
+		for (unsigned int j = 0; j < sectorPerBlock; j++)
+		{
+			char sector[DISK_SECTORDATASIZE];
+			memcpy(sector, &buffer[i * superblock[SUPERBLOCK_ITEM_BLOCKSIZE] + j * DISK_SECTORDATASIZE], DISK_SECTORDATASIZE);
+			if (diskWriteSector(d, firstSector + j, sector) == -1)
+				return -1;
+		}
+	}
+	setBlocksStatus(numBlocks, blocks, 1);
+	free(blocks);
+	free(buffer);
+	return 0;
+}
 
 // Funcao para verificacao se o sistema de arquivos está ocioso, ou seja,
 // se nao ha quisquer descritores de arquivos em uso atualmente. Retorna
 // um positivo se ocioso ou, caso contrario, 0.
 int myFSIsIdle(Disk *d)
 {
-	return 0;
+	// for (int i = 0; i < MAX_FILES; i++)
+	// {
+	// 	if (inodeGetRefCount(inodeLoad(i + 1, d)) > 0)
+	// 		return 0;
+	// }
+
+	return 1;
 }
 
 // Funcao para formatacao de um disco com o novo sistema de arquivos
 // com tamanho de blocos igual a blockSize. Retorna o numero total de
 // blocos disponiveis no disco, se formatado com sucesso. Caso contrario,
 // retorna -1.
-int myFSFormat(Disk *d, unsigned int blockSize /* tamanho do cluster */)
+int myFSFormat(Disk *d, unsigned int blockSize)
 {
 	// Verificação de parâmetros inválidos
-	if (d == NULL || blockSize <= 0)
+	if (d == NULL || blockSize == 0)
 		return -1;
 
-	unsigned long totalBlocks = diskGetSize(d) / blockSize;
+	// criar superbloco
+	superblock[SUPERBLOCK_ITEM_BLOCKSIZE] = blockSize;
+	superblock[SUPERBLOCK_ITEM_NUMBLOCKS] = diskGetSize(d) / blockSize;
+	superblock[SUPERBLOCK_ITEM_NUMINODES] = superblock[SUPERBLOCK_ITEM_NUMBLOCKS] / NUMBLOCKS_PERINODE;
+	if (saveSuperblock(d) == -1)
+		return -1;
 
+	// criar bitmap
+	bitmap = malloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS] * sizeof(char));
+	for (int i = 0; i < superblock[SUPERBLOCK_ITEM_NUMBLOCKS]; i++)
+		bitmap[i] = 0;
+	if (diskWriteSector(d, BITMAP_SECTOR, bitmap) == -1)
+		return -1;
+
+	Inode *inodeRoot;
 	// Inicializar i-nodes
-	for (int i = 0; i < MAX_FILES; i++)
+	for (int i = 1; i < superblock[SUPERBLOCK_ITEM_NUMINODES] + 1; i++)
 	{
-		if (inodeCreate(i, d) == NULL)
+		Inode *inode = inodeCreate(i, d);
+		if (inode == NULL)
 			return -1;
+
+		if (i == ROOT_INODE_NUMBER)
+		{
+			inodeRoot = inode;
+			inodeSetFileType(inode, FILETYPE_DIR);
+			inodeSetRefCount(inode, 2);
+		}
+		else
+		{
+			free(inode);
+		}
 	}
 
-	return totalBlocks;
+	unsigned int inodesSectors = superblock[SUPERBLOCK_ITEM_NUMINODES] / inodeNumInodesPerSector();
+	unsigned int inodesBlocks = inodesSectors * DISK_SECTORDATASIZE / blockSize;
+	for (int i = 0; i < inodesBlocks; i++)
+		bitmap[i] = 1;
+
+	Directory *root = createDirectory(d);
+	addDirectoryEntry(root, "..", ROOT_INODE_NUMBER);
+	saveDirectory(d, root, inodeRoot);
+	free(root);
+
+	return superblock[SUPERBLOCK_ITEM_NUMBLOCKS];
 }
 
 // Funcao para abertura de um arquivo, a partir do caminho especificado
@@ -54,6 +221,7 @@ int myFSFormat(Disk *d, unsigned int blockSize /* tamanho do cluster */)
 // em caso de sucesso. Retorna -1, caso contrario.
 int myFSOpen(Disk *d, const char *path)
 {
+
 	return -1;
 }
 
@@ -140,7 +308,7 @@ int myFSCloseDir(int fd)
 int installMyFS(void)
 {
 	FSInfo *myfs = (FSInfo *)malloc(sizeof(FSInfo));
-	myfs->fsid = 'A';
+	myfs->fsid = 1;
 	myfs->fsname = "WillianFS";
 	myfs->isidleFn = myFSIsIdle;
 	myfs->formatFn = myFSFormat;
@@ -154,7 +322,5 @@ int installMyFS(void)
 	myfs->unlinkFn = myFSUnlink;
 	myfs->closedirFn = myFSCloseDir;
 
-	int result = vfsRegisterFS(myfs);
-	// free(myfs);
-	return result;
+	return vfsRegisterFS(myfs);
 }
