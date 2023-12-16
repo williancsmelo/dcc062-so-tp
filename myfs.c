@@ -22,10 +22,10 @@
 #define NUMBLOCKS_PERINODE 8
 
 #define ROOT_INODE_NUMBER 1
-Inode *inodeRoot = NULL;
+Inode *inodeRoot;
 int loadRootInode(Disk *d)
 {
-	if (inodeRoot == NULL)
+	if (inodeRoot != NULL)
 		return 0;
 	inodeRoot = inodeLoad(ROOT_INODE_NUMBER, d);
 	if (inodeRoot == NULL)
@@ -47,19 +47,33 @@ unsigned int *superblock = NULL;
 char *bitmap = NULL; // tamanho = numero de blocos | 1 = ocupado, 0 = livre
 
 #define MAX_OPEN_FILES 20
-Inode *openFiles[MAX_OPEN_FILES];
+typedef struct fileDescriptor
+{
+	unsigned int fd;
+	Inode *inode;
+	Disk *disk;
+	unsigned int cursor;
+} FileDescriptor;
+FileDescriptor *openFiles[MAX_OPEN_FILES];
 unsigned int numOpenFiles = 0;
+unsigned int lastFd = 0;
 
-int writeBlock(Disk *d, unsigned int block, const char *buf)
+int writeBlock(Disk *d, unsigned int block, const char *buf, unsigned int size)
 {
 	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
 	unsigned int firstSector = block * sectorPerBlock;
+	if (buf == NULL || firstSector < inodeAreaBeginSector())
+		return -1;
+	if (size > superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
+		size = superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
 	for (unsigned int i = 0; i < sectorPerBlock; i++)
 	{
+		unsigned int sizeToWrite = size > DISK_SECTORDATASIZE ? DISK_SECTORDATASIZE : size;
 		unsigned char sector[DISK_SECTORDATASIZE];
-		memcpy(sector, &buf[i * DISK_SECTORDATASIZE], DISK_SECTORDATASIZE);
+		memcpy(sector, &buf[i * DISK_SECTORDATASIZE], sizeToWrite);
 		if (diskWriteSector(d, firstSector + i, sector) == -1)
 			return -1;
+		size -= DISK_SECTORDATASIZE;
 	}
 	return 0;
 }
@@ -68,6 +82,8 @@ int readBlock(Disk *d, unsigned int block, char *buf)
 {
 	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
 	unsigned int firstSector = block * sectorPerBlock;
+	if (buf == NULL || firstSector < inodeAreaBeginSector())
+		return -1;
 	for (unsigned int i = 0; i < sectorPerBlock; i++)
 	{
 		unsigned char sector[DISK_SECTORDATASIZE];
@@ -90,17 +106,30 @@ int saveSuperblock(Disk *d)
 
 int loadSuperblock(Disk *d)
 {
-	free(superblock);
+	if (superblock != NULL)
+		return 0;
 	unsigned char sector[DISK_SECTORDATASIZE];
 	if (diskReadSector(d, SUPERBLOCK_SECTOR, sector) == -1)
 		return -1;
 	superblock = malloc(SUPERBLOCK_SIZE * sizeof(unsigned int));
+	if (superblock == NULL)
+		return -1;
 	for (int a = 0; a < SUPERBLOCK_SIZE; a++)
 		char2ul(&sector[a * sizeof(unsigned int)], &(superblock[a]));
 	return 0;
 }
 
 // funções do bitmap
+int loadBitmap(Disk *d)
+{
+	if (bitmap != NULL)
+		return 0;
+	bitmap = calloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS], sizeof(unsigned char));
+	if (bitmap == NULL)
+		return -1;
+	return readBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap);
+}
+
 int saveBitmap(Disk *d)
 {
 	const unsigned int firstSector = superblock[SUPERBLOCK_ITEM_BITMAPBLOCK] * superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
@@ -222,7 +251,6 @@ int addDirectoryEntry(Disk *d, Inode *inodeDir, Inode *inodeEntry, const char *e
 		return -1;
 	entry->inodeNumber = inodeGetNumber(inodeEntry);
 	strncpy(entry->name, entryName, MAX_FILENAME_LENGTH);
-	// save entry
 
 	unsigned char toSaveBuffer[sizeof(DirectoryEntry)];
 	ul2char(entry->inodeNumber, toSaveBuffer);
@@ -255,13 +283,13 @@ int addDirectoryEntry(Disk *d, Inode *inodeDir, Inode *inodeEntry, const char *e
 				finalBlockBuffer[offset] = toSaveBuffer[i];
 			offset++;
 		}
-		if (writeBlock(d, blocks[0], newBlockBuffer) == -1)
+		if (writeBlock(d, blocks[0], newBlockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
 			return -1;
 		inodeAddBlock(inodeDir, blocks[0]);
 		setBlocksStatus(1, blocks, 1);
 	}
 
-	if (writeBlock(d, finalBlock, finalBlockBuffer) == -1)
+	if (writeBlock(d, finalBlock, finalBlockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
 		return -1;
 
 	inodeSetFileSize(inodeDir, inodeGetFileSize(inodeDir) + sizeof(DirectoryEntry));
@@ -305,6 +333,37 @@ unsigned int findInodeNumber(Directory *dir, const char *name)
 	return 0;
 }
 
+// funções open file
+FileDescriptor *createFileDescriptor(Disk *d, Inode *inode)
+{
+	if (numOpenFiles >= MAX_OPEN_FILES)
+		return NULL;
+	FileDescriptor *openFile = malloc(sizeof(FileDescriptor));
+	if (openFile == NULL)
+		return NULL;
+	openFile->fd = ++lastFd;
+	openFile->inode = inode;
+	openFile->disk = d;
+	openFile->cursor = 0;
+	openFiles[numOpenFiles++] = openFile;
+	return openFile;
+}
+
+FileDescriptor *getFileDescriptor(unsigned int fd)
+{
+	for (unsigned int i = 0; i < numOpenFiles; i++)
+		if (openFiles[i]->fd == fd)
+			return openFiles[i];
+	return NULL;
+}
+
+int loadFSData(Disk *d)
+{
+	if (loadSuperblock(d) == -1 || loadRootInode(d) == -1 || loadBitmap(d) == -1)
+		return -1;
+	return 0;
+}
+
 // Funcao para verificacao se o sistema de arquivos está ocioso, ou seja,
 // se nao ha quisquer descritores de arquivos em uso atualmente. Retorna
 // um positivo se ocioso ou, caso contrario, 0.
@@ -331,7 +390,6 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	superblock[SUPERBLOCK_ITEM_NUMBLOCKS] = diskGetSize(d) / blockSize;
 	superblock[SUPERBLOCK_ITEM_NUMINODES] = superblock[SUPERBLOCK_ITEM_NUMBLOCKS] / NUMBLOCKS_PERINODE;
 
-	Inode *inodeRoot;
 	// Inicializar i-nodes
 	for (int i = 1; i < superblock[SUPERBLOCK_ITEM_NUMINODES] + 1; i++)
 	{
@@ -382,7 +440,6 @@ int splitPath(const char *path, char ***entries)
 	char *token = strtok(pathCopy, "/");
 	while (token != NULL)
 	{
-		// Ignorar entradas "." (atual) e ".." (anterior)
 		if (strcmp(token, ".") != 0 && strcmp(token, "..") != 0)
 			result[count++] = strdup(token);
 		token = strtok(NULL, "/");
@@ -401,6 +458,8 @@ int splitPath(const char *path, char ***entries)
 // em caso de sucesso. Retorna -1, caso contrario.
 int myFSOpen(Disk *d, const char *path)
 {
+	if (loadFSData(d) == -1)
+		return -1;
 	if (numOpenFiles >= MAX_OPEN_FILES)
 		return -1;
 	char **entries;
@@ -411,8 +470,8 @@ int myFSOpen(Disk *d, const char *path)
 	if (loadRootInode(d) == -1)
 		return -1;
 
-	Inode *inode = NULL;
-	Directory *dir = NULL;
+	Inode *inode;
+	Directory *dir;
 	char foundDir = 0;
 	for (int i = 0; i < numEntries - 1; i++)
 	{
@@ -431,59 +490,48 @@ int myFSOpen(Disk *d, const char *path)
 		if (i == numEntries - 2)
 			foundDir = 1;
 	}
-	char foundFile = 0;
+	Inode *inodeFile = NULL;
 	if (foundDir)
 		dir = loadDirectory(d, inode);
-	Inode *inodeFile = NULL;
 	if (dir != NULL)
 	{
 		unsigned int inodeNumber = findInodeNumber(dir, entries[numEntries - 1]);
 		if (inodeNumber != 0)
-		{
 			inodeFile = inodeLoad(inodeNumber, d);
-			if (inodeFile != NULL)
-				foundFile = 1;
-		}
 		else
 		{
 			inodeNumber = inodeFindFreeInode(ROOT_INODE_NUMBER + 1, d);
 			if (inodeNumber != 0)
 			{
 				inodeFile = inodeCreate(inodeNumber, d);
-				if (inode != NULL)
+				if (inodeFile != NULL)
 				{
 					inodeSetFileType(inode, FILETYPE_REGULAR);
 					addDirectoryEntry(d, inode, inodeFile, entries[numEntries - 1]);
-					foundFile = 1;
 				}
 			}
 		}
 	}
 
-	int fd = -1;
-	if (foundFile)
+	unsigned int fd = 0;
+	if (inodeFile != NULL)
 	{
 		for (unsigned int i = 0; i < numOpenFiles; i++)
 		{
-			if (openFiles[i] == inodeFile)
+			if (openFiles[i]->inode == inodeFile)
 			{
-				// File is already open, return its file descriptor
-				free(entries);
-				return i;
+				fd = openFiles[i]->fd;
+				break;
 			}
 		}
+		if (!fd)
+		{
+			FileDescriptor *newFileDescriptor = createFileDescriptor(d, inodeFile);
+			if (newFileDescriptor != NULL)
+				fd = newFileDescriptor->fd;
+		}
+		return fd;
 	}
-
-	// Check if the file is already open
-
-	// Add the file to the open files array
-	openFiles[numOpenFiles++] = inode;
-
-	// Free the memory allocated for the path entries
-	free(entries);
-
-	// Return the file descriptor (index in the open files array)
-	return numOpenFiles - 1;
 }
 
 // Funcao para a leitura de um arquivo, a partir de um descritor de
@@ -492,7 +540,34 @@ int myFSOpen(Disk *d, const char *path)
 // lidos em caso de sucesso ou -1, caso contrario.
 int myFSRead(int fd, char *buf, unsigned int nbytes)
 {
-	return -1;
+	FileDescriptor *openFile = getFileDescriptor(fd);
+	if (openFile == NULL || loadFSData(openFile->disk) == -1)
+		return -1;
+
+	unsigned int sizeToRead = nbytes > inodeGetFileSize(openFile->inode) ? inodeGetFileSize(openFile->inode) : nbytes;
+	unsigned int numBlocks = ceil((float)sizeToRead / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int offset = 0;
+	unsigned char *blockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	for (unsigned int i = 0; i < numBlocks; i++)
+	{
+		if (i + 1 >= numBlocks)
+		{
+			if (readBlock(openFile->disk, inodeGetBlockAddr(openFile->inode, i), &buf[offset]) == -1)
+				break;
+			offset += superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+		}
+		else
+		{
+			if (readBlock(openFile->disk, inodeGetBlockAddr(openFile->inode, i), blockBuffer) == -1)
+				break;
+			memcpy(&buf[offset], blockBuffer, sizeToRead - offset);
+			offset += sizeToRead - offset;
+		}
+	}
+	free(blockBuffer);
+	if (offset != sizeToRead)
+		return -1;
+	return offset;
 }
 
 // Funcao para a escrita de um arquivo, a partir de um descritor de
@@ -501,15 +576,101 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 // efetivamente escritos em caso de sucesso ou -1, caso contrario
 int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 {
-	return -1;
+	FileDescriptor *openFile = getFileDescriptor(fd);
+	if (openFile == NULL || loadFSData(openFile->disk) == -1)
+		return -1;
+
+	unsigned int bufferOffset = 0;
+	unsigned int cursorBlock = openFile->cursor / superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+	unsigned char *blockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int block = inodeGetBlockAddr(openFile->inode, cursorBlock);
+	if (block)
+	{
+		unsigned int cursorBlockOffset = openFile->cursor % superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+		if (readBlock(openFile->disk, block, blockBuffer) == -1)
+		{
+			free(blockBuffer);
+			return -1;
+		}
+		for (unsigned int i = 0; i < superblock[SUPERBLOCK_ITEM_BLOCKSIZE] - cursorBlockOffset; i++)
+		{
+			blockBuffer[cursorBlockOffset] = buf[bufferOffset];
+			bufferOffset++;
+			cursorBlockOffset++;
+		}
+		if (writeBlock(openFile->disk, block, blockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
+		{
+			free(blockBuffer);
+			return -1;
+		}
+		cursorBlock++;
+
+		unsigned int numBlocks = ceil((float)(nbytes - bufferOffset) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+		unsigned int *newBlocks;
+		unsigned int newBlocksOffset = 0;
+		for (unsigned int i = 0; i < numBlocks; i++)
+		{
+			unsigned int sizeToWrite = superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+			if (nbytes - bufferOffset < superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
+				sizeToWrite = nbytes - bufferOffset;
+			block = inodeGetBlockAddr(openFile->inode, cursorBlock);
+			if (block)
+			{
+				if (writeBlock(openFile->disk, block, &buf[bufferOffset], sizeToWrite) == -1)
+					break;
+				bufferOffset += sizeToWrite;
+			}
+			else
+			{
+				if (newBlocks == NULL)
+				{
+					unsigned int numNewBlocks = ceil((float)(nbytes - bufferOffset) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+					newBlocks = malloc(numNewBlocks * sizeof(unsigned int));
+					if (newBlocks == NULL || findFreeBlocks(numNewBlocks, newBlocks) == -1)
+						break;
+				}
+				if (writeBlock(openFile->disk, newBlocks[newBlocksOffset], &buf[bufferOffset], sizeToWrite) == -1)
+					break;
+				inodeAddBlock(openFile->inode, newBlocks[newBlocksOffset]);
+				newBlocksOffset++;
+				bufferOffset += sizeToWrite;
+			}
+		}
+		free(blockBuffer);
+		if (newBlocks != NULL)
+		{
+			setBlocksStatus(newBlocksOffset, newBlocks, 1);
+			saveBitmap(openFile->disk);
+			free(newBlocks);
+		}
+		inodeSetFileSize(openFile->inode, inodeGetFileSize(openFile->inode) + bufferOffset);
+		inodeSave(openFile->inode);
+		openFile->cursor += bufferOffset;
+		return bufferOffset;
+	}
 }
 
 // Funcao para fechar um arquivo, a partir de um descritor de arquivo
 // existente. Retorna 0 caso bem sucedido, ou -1 caso contrario
 int myFSClose(int fd)
 {
-
-	return -1;
+	FileDescriptor *fileToRemove;
+	for (int i = 0; i < numOpenFiles; i++)
+	{
+		if (openFiles[i]->fd == fd)
+		{
+			fileToRemove = openFiles[i];
+			break;
+		}
+		if (fileToRemove != NULL)
+			openFiles[i] = openFiles[i + 1];
+	}
+	if (fileToRemove == NULL)
+		return -1;
+	free(fileToRemove->inode);
+	free(fileToRemove);
+	numOpenFiles--;
+	return 0;
 }
 
 // Funcao para abertura de um diretorio, a partir do caminho
