@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include "myfs.h"
 #include "vfs.h"
@@ -17,21 +18,67 @@
 #include "util.h"
 
 // Declaracoes globais
-#define ROOT_INODE_NUMBER 1
+#define MAX_PATH_LENGTH 1000
 #define NUMBLOCKS_PERINODE 8
+
+#define ROOT_INODE_NUMBER 1
+Inode *inodeRoot = NULL;
+int loadRootInode(Disk *d)
+{
+	if (inodeRoot == NULL)
+		return 0;
+	inodeRoot = inodeLoad(ROOT_INODE_NUMBER, d);
+	if (inodeRoot == NULL)
+		return -1;
+	return 0;
+}
 
 // superbloco
 #define SUPERBLOCK_SECTOR 0
-#define SUPERBLOCK_SIZE 3 // Tamanho do superbloco em numero de unsigned ints
+#define SUPERBLOCK_SIZE 4 // Tamanho do superbloco em numero de unsigned ints
 #define SUPERBLOCK_ITEM_BLOCKSIZE 0
 #define SUPERBLOCK_ITEM_NUMBLOCKS 1
 #define SUPERBLOCK_ITEM_NUMINODES 2
+#define SUPERBLOCK_ITEM_BITMAPBLOCK 3
+unsigned int *superblock = NULL;
 
 // bitmap
 #define BITMAP_SECTOR 1
+char *bitmap = NULL; // tamanho = numero de blocos | 1 = ocupado, 0 = livre
+
+#define MAX_OPEN_FILES 20
+Inode *openFiles[MAX_OPEN_FILES];
+unsigned int numOpenFiles = 0;
+
+int writeBlock(Disk *d, unsigned int block, const char *buf)
+{
+	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	unsigned int firstSector = block * sectorPerBlock;
+	for (unsigned int i = 0; i < sectorPerBlock; i++)
+	{
+		unsigned char sector[DISK_SECTORDATASIZE];
+		memcpy(sector, &buf[i * DISK_SECTORDATASIZE], DISK_SECTORDATASIZE);
+		if (diskWriteSector(d, firstSector + i, sector) == -1)
+			return -1;
+	}
+	return 0;
+}
+
+int readBlock(Disk *d, unsigned int block, char *buf)
+{
+	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	unsigned int firstSector = block * sectorPerBlock;
+	for (unsigned int i = 0; i < sectorPerBlock; i++)
+	{
+		unsigned char sector[DISK_SECTORDATASIZE];
+		if (diskReadSector(d, firstSector + i, sector) == -1)
+			return -1;
+		memcpy(&buf[i * DISK_SECTORDATASIZE], sector, DISK_SECTORDATASIZE);
+	}
+	return 0;
+}
 
 // Funções do superbloco
-unsigned int superblock[SUPERBLOCK_SIZE];
 int saveSuperblock(Disk *d)
 {
 	unsigned char sector[DISK_SECTORDATASIZE];
@@ -43,16 +90,29 @@ int saveSuperblock(Disk *d)
 
 int loadSuperblock(Disk *d)
 {
+	free(superblock);
 	unsigned char sector[DISK_SECTORDATASIZE];
 	if (diskReadSector(d, SUPERBLOCK_SECTOR, sector) == -1)
 		return -1;
+	superblock = malloc(SUPERBLOCK_SIZE * sizeof(unsigned int));
 	for (int a = 0; a < SUPERBLOCK_SIZE; a++)
 		char2ul(&sector[a * sizeof(unsigned int)], &(superblock[a]));
 	return 0;
 }
 
 // funções do bitmap
-char *bitmap; // tamanho = numero de blocos | 1 = ocupado, 0 = livre
+int saveBitmap(Disk *d)
+{
+	const unsigned int firstSector = superblock[SUPERBLOCK_ITEM_BITMAPBLOCK] * superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	const unsigned int numSectors = sizeof(unsigned char) * superblock[SUPERBLOCK_ITEM_NUMBLOCKS] / DISK_SECTORDATASIZE;
+	for (int i = 0; i < numSectors; i++)
+	{
+		unsigned char sector[DISK_SECTORDATASIZE];
+		memcpy(sector, &bitmap[i * DISK_SECTORDATASIZE], DISK_SECTORDATASIZE);
+		if (diskWriteSector(d, firstSector + i, sector) == -1)
+			return -1;
+	}
+}
 
 int findFreeBlocks(unsigned int numBlocks, unsigned int *blocks)
 {
@@ -88,59 +148,165 @@ typedef struct directoryEntry
 
 typedef struct directory
 {
-	DirectoryEntry *entries;
+	DirectoryEntry **entries;
 	unsigned int numEntries;
 } Directory;
 
-void addDirectoryEntry(Directory *dir, char *name, unsigned int inodeNumber)
-{
-	DirectoryEntry *entry = malloc(sizeof(DirectoryEntry));
-	strcpy(entry->name, name);
-	entry->inodeNumber = inodeNumber;
-	dir->entries[dir->numEntries] = *entry;
-	dir->numEntries++;
-}
-
-Directory *createDirectory()
+Directory *loadDirectory(Disk *d, Inode *inode)
 {
 	Directory *dir = malloc(sizeof(Directory));
-	dir->numEntries = 0;
-	addDirectoryEntry(dir, ".", 1);
+	if (dir == NULL)
+		return NULL;
+	unsigned int numBlocks = ceil((float)inodeGetFileSize(inode) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	unsigned char *buffer = malloc(numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	for (unsigned int i = 0; i < numBlocks; i++)
+	{
+		unsigned int block = inodeGetBlockAddr(inode, i);
+		unsigned int firstSector = block * sectorPerBlock;
+		for (unsigned int j = 0; j < sectorPerBlock; j++)
+		{
+			if (diskReadSector(d, firstSector + j, &buffer[j * DISK_SECTORDATASIZE + i * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]]) == -1)
+				return NULL;
+		}
+	}
+	char2ul(&buffer[0], &(dir->numEntries));
+	unsigned int offset = sizeof(unsigned int);
+	if (dir->numEntries > 0)
+	{
+		dir->entries = malloc(dir->numEntries * sizeof(DirectoryEntry *));
+		for (unsigned int i = 0; i < dir->numEntries; i++)
+		{
+			dir->entries[i] = malloc(sizeof(DirectoryEntry));
+			char2ul(&buffer[offset], &(dir->entries[i]->inodeNumber));
+			offset += sizeof(unsigned int);
+			memcpy(&buffer[offset], dir->entries[i]->name, MAX_FILENAME_LENGTH);
+			offset += MAX_FILENAME_LENGTH;
+		}
+	}
+	else
+	{
+		dir->entries = NULL;
+	}
+	free(buffer);
 	return dir;
 }
 
-int saveDirectory(Disk *d, Directory *dir, Inode *inode)
+void freeDirectory(Directory *dir)
 {
-	unsigned int directorySize = (dir->numEntries * sizeof(DirectoryEntry)) + sizeof(unsigned int);
-	unsigned int numBlocks = ceil((double)directorySize / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-	unsigned int *blocks = malloc(numBlocks * sizeof(unsigned int));
-	if (findFreeBlocks(numBlocks, blocks) == -1)
-		return -1;
-	char *buffer = malloc(numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-	unsigned int offset = sizeof(unsigned int);
-	ul2char(dir->numEntries, &buffer[0]);
+	if (dir == NULL)
+		return;
 	for (unsigned int i = 0; i < dir->numEntries; i++)
+		free(dir->entries[i]);
+	free(dir->entries);
+	free(dir);
+}
+
+int addDirectoryEntry(Disk *d, Inode *inodeDir, unsigned int inodeEntryNumber, const char *entryName)
+{
+
+	Directory *dir = loadDirectory(d, inodeDir);
+
+	if (dir == NULL)
+		return -1;
+	DirectoryEntry *entry = malloc(sizeof(DirectoryEntry));
+
+	if (entry == NULL)
+		return -1;
+
+	for (unsigned int i = 0; i < dir->numEntries; i++)
+		if (strcmp(dir->entries[i]->name, entryName) == 0)
+			return -1;
+	free(dir);
+
+	entry->inodeNumber = inodeEntryNumber;
+
+	strncpy(entry->name, entryName, MAX_FILENAME_LENGTH);
+	// save entry
+
+	unsigned char toSaveBuffer[sizeof(DirectoryEntry)];
+	ul2char(entry->inodeNumber, toSaveBuffer);
+	memcpy(&toSaveBuffer[sizeof(unsigned int)], entry->name, MAX_FILENAME_LENGTH);
+	free(entry);
+
+	unsigned int finalBlock = inodeGetBlockAddr(inodeDir, inodeGetFileSize(inodeDir) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned char finalBlockBuffer[superblock[SUPERBLOCK_ITEM_BLOCKSIZE]];
+
+	if (readBlock(d, finalBlock, finalBlockBuffer) == -1)
+		return -1;
+
+	unsigned int finalBlockFreeSpace = inodeGetFileSize(inodeDir) % superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+
+	unsigned int offset = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] - finalBlockFreeSpace;
+
+	if (finalBlockFreeSpace > sizeof(DirectoryEntry))
+		memcpy(&finalBlockBuffer[offset], toSaveBuffer, sizeof(DirectoryEntry));
+	else
 	{
-		ul2char(dir->entries[i].inodeNumber, &buffer[offset]);
-		offset += sizeof(unsigned int);
-		memcpy(&buffer[offset], dir->entries[i].name, MAX_FILENAME_LENGTH);
-		offset += MAX_FILENAME_LENGTH;
-	}
-	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
-	for (unsigned int i = 0; i < numBlocks; i++)
-	{
-		unsigned int firstSector = blocks[i] * sectorPerBlock;
-		for (unsigned int j = 0; j < sectorPerBlock; j++)
+		unsigned int blocks[1];
+		if (findFreeBlocks(1, blocks) == -1)
+			return -1;
+		unsigned char newBlockBuffer[superblock[SUPERBLOCK_ITEM_BLOCKSIZE]];
+		for (unsigned int i = 0; i < sizeof(DirectoryEntry); i++)
 		{
-			char sector[DISK_SECTORDATASIZE];
-			memcpy(sector, &buffer[i * superblock[SUPERBLOCK_ITEM_BLOCKSIZE] + j * DISK_SECTORDATASIZE], DISK_SECTORDATASIZE);
-			if (diskWriteSector(d, firstSector + j, sector) == -1)
-				return -1;
+			if (offset >= superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
+				newBlockBuffer[offset - superblock[SUPERBLOCK_ITEM_BLOCKSIZE]] = toSaveBuffer[i];
+			else
+				finalBlockBuffer[offset] = toSaveBuffer[i];
+			offset++;
 		}
+		if (writeBlock(d, blocks[0], newBlockBuffer) == -1)
+			return -1;
+
+		inodeAddBlock(inodeDir, blocks[0]);
+		setBlocksStatus(1, blocks, 1);
 	}
-	setBlocksStatus(numBlocks, blocks, 1);
-	free(blocks);
-	free(buffer);
+
+	if (writeBlock(d, finalBlock, finalBlockBuffer) == -1)
+		return -1;
+
+	inodeSetFileSize(inodeDir, inodeGetFileSize(inodeDir) + sizeof(DirectoryEntry));
+	Inode *entryInode = inodeLoad(inodeEntryNumber, d);
+
+	if (entryInode == NULL)
+		return -1;
+	inodeSetRefCount(entryInode, inodeGetRefCount(entryInode) + 1);
+
+	if (inodeSave(entryInode) == -1 || inodeSave(inodeDir) == -1)
+		return -1;
+	return saveBitmap(d);
+}
+
+int createDirectory(Disk *d, Inode *inode)
+{
+	Directory *dir = malloc(sizeof(Directory));
+	if (dir == NULL)
+		return -1;
+	dir->numEntries = 0;
+	dir->entries = NULL;
+	unsigned int blocks[1];
+	if (findFreeBlocks(1, blocks) == -1)
+		return -1;
+	unsigned char sector[DISK_SECTORDATASIZE];
+	ul2char(dir->numEntries, sector);
+	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	if (diskWriteSector(d, blocks[0] * sectorPerBlock, sector) == -1)
+		return -1;
+	inodeSetFileSize(inode, sizeof(unsigned int));
+	inodeSetFileType(inode, FILETYPE_DIR);
+	inodeSetRefCount(inode, 1);
+	inodeAddBlock(inode, blocks[0]);
+	setBlocksStatus(1, blocks, 1);
+	saveBitmap(d);
+	free(dir);
+	return addDirectoryEntry(d, inode, inodeGetNumber(inode), ".");
+}
+
+unsigned int findInodeNumber(Directory *dir, const char *name)
+{
+	for (unsigned int i = 0; i < dir->numEntries; i++)
+		if (strcmp(dir->entries[i]->name, name) == 0)
+			return dir->entries[i]->inodeNumber;
 	return 0;
 }
 
@@ -149,12 +315,8 @@ int saveDirectory(Disk *d, Directory *dir, Inode *inode)
 // um positivo se ocioso ou, caso contrario, 0.
 int myFSIsIdle(Disk *d)
 {
-	// for (int i = 0; i < MAX_FILES; i++)
-	// {
-	// 	if (inodeGetRefCount(inodeLoad(i + 1, d)) > 0)
-	// 		return 0;
-	// }
-
+	if (numOpenFiles > 0)
+		return 0;
 	return 1;
 }
 
@@ -169,18 +331,10 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 		return -1;
 
 	// criar superbloco
+	superblock = malloc(SUPERBLOCK_SIZE * sizeof(unsigned int));
 	superblock[SUPERBLOCK_ITEM_BLOCKSIZE] = blockSize;
 	superblock[SUPERBLOCK_ITEM_NUMBLOCKS] = diskGetSize(d) / blockSize;
 	superblock[SUPERBLOCK_ITEM_NUMINODES] = superblock[SUPERBLOCK_ITEM_NUMBLOCKS] / NUMBLOCKS_PERINODE;
-	if (saveSuperblock(d) == -1)
-		return -1;
-
-	// criar bitmap
-	bitmap = malloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS] * sizeof(char));
-	for (int i = 0; i < superblock[SUPERBLOCK_ITEM_NUMBLOCKS]; i++)
-		bitmap[i] = 0;
-	if (diskWriteSector(d, BITMAP_SECTOR, bitmap) == -1)
-		return -1;
 
 	Inode *inodeRoot;
 	// Inicializar i-nodes
@@ -191,28 +345,60 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 			return -1;
 
 		if (i == ROOT_INODE_NUMBER)
-		{
 			inodeRoot = inode;
-			inodeSetFileType(inode, FILETYPE_DIR);
-			inodeSetRefCount(inode, 2);
-		}
 		else
-		{
 			free(inode);
-		}
 	}
 
+	// criar bitmap
+	bitmap = calloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS], sizeof(unsigned char));
 	unsigned int inodesSectors = superblock[SUPERBLOCK_ITEM_NUMINODES] / inodeNumInodesPerSector();
-	unsigned int inodesBlocks = inodesSectors * DISK_SECTORDATASIZE / blockSize;
-	for (int i = 0; i < inodesBlocks; i++)
+	unsigned int inodesBlocks = (inodesSectors + inodeAreaBeginSector()) * DISK_SECTORDATASIZE / blockSize;
+	for (int i = 0; i < inodesBlocks + 1; i++)
 		bitmap[i] = 1;
+	superblock[SUPERBLOCK_ITEM_BITMAPBLOCK] = inodesBlocks;
+	if (saveSuperblock(d) == -1)
+		return -1;
+	if (saveBitmap(d) == -1)
+		return -1;
 
-	Directory *root = createDirectory(d);
-	addDirectoryEntry(root, "..", ROOT_INODE_NUMBER);
-	saveDirectory(d, root, inodeRoot);
-	free(root);
-
+	// create root
+	if (createDirectory(d, inodeRoot) == -1)
+		return -1;
+	// if (addDirectoryEntry(d, inodeRoot, ROOT_INODE_NUMBER, "..") == -1)
+	// 	return -1;
+	free(inodeRoot);
 	return superblock[SUPERBLOCK_ITEM_NUMBLOCKS];
+}
+
+int splitPath(const char *path, char ***entries)
+{
+	if (path == NULL || path[0] == '\0')
+	{
+		*entries = NULL;
+		return 0;
+	}
+
+	char **result = malloc(MAX_PATH_LENGTH * sizeof(char *));
+	char *pathCopy = strdup(path);
+	if (result == NULL || pathCopy == NULL)
+		return -1;
+
+	int count = 0;
+	char *token = strtok(pathCopy, "/");
+	while (token != NULL)
+	{
+		// Ignorar entradas "." (atual) e ".." (anterior)
+		if (strcmp(token, ".") != 0 && strcmp(token, "..") != 0)
+			result[count++] = strdup(token);
+		token = strtok(NULL, "/");
+	}
+	free(pathCopy);
+	result = (char **)realloc(result, count * sizeof(char *));
+	if (result == NULL)
+		return -1;
+	*entries = result;
+	return count;
 }
 
 // Funcao para abertura de um arquivo, a partir do caminho especificado
@@ -221,8 +407,53 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 // em caso de sucesso. Retorna -1, caso contrario.
 int myFSOpen(Disk *d, const char *path)
 {
+	if (numOpenFiles >= MAX_OPEN_FILES)
+		return -1;
+	char **entries;
+	int numEntries = splitPath(path, &entries);
+	if (numEntries == -1)
+		return -1;
 
-	return -1;
+	if (loadRootInode(d) == -1)
+		return -1;
+	Directory *dir = loadDirectory(d, inodeRoot);
+	if (dir == NULL)
+		return -1;
+
+	Inode *inode = inodeRoot;
+	for (int i = 0; i < numEntries; i++)
+	{
+		if (inodeGetFileType(inode) != FILETYPE_DIR)
+			return -1;
+		Directory *dir = loadDirectory(d, inode);
+		if (dir == NULL)
+			return -1;
+		unsigned int inodeNumber = findInodeNumber(dir, entries[i]);
+		freeDirectory(dir);
+		inode = inodeLoad(inodeNumber, d);
+		if (inode == NULL)
+			return -1;
+	}
+
+	// Check if the file is already open
+	for (unsigned int i = 0; i < numOpenFiles; i++)
+	{
+		if (openFiles[i] == inode)
+		{
+			// File is already open, return its file descriptor
+			free(entries);
+			return i;
+		}
+	}
+
+	// Add the file to the open files array
+	openFiles[numOpenFiles++] = inode;
+
+	// Free the memory allocated for the path entries
+	free(entries);
+
+	// Return the file descriptor (index in the open files array)
+	return numOpenFiles - 1;
 }
 
 // Funcao para a leitura de um arquivo, a partir de um descritor de
@@ -247,6 +478,7 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 // existente. Retorna 0 caso bem sucedido, ou -1 caso contrario
 int myFSClose(int fd)
 {
+
 	return -1;
 }
 
@@ -307,7 +539,7 @@ int myFSCloseDir(int fd)
 // Caso contrario, retorna -1
 int installMyFS(void)
 {
-	FSInfo *myfs = (FSInfo *)malloc(sizeof(FSInfo));
+	FSInfo *myfs = malloc(sizeof(FSInfo));
 	myfs->fsid = 1;
 	myfs->fsname = "WillianFS";
 	myfs->isidleFn = myFSIsIdle;
