@@ -154,6 +154,8 @@ typedef struct directory
 
 Directory *loadDirectory(Disk *d, Inode *inode)
 {
+	if (inodeGetFileType(inode) != FILETYPE_DIR)
+		return NULL;
 	Directory *dir = malloc(sizeof(Directory));
 	if (dir == NULL)
 		return NULL;
@@ -202,25 +204,23 @@ void freeDirectory(Directory *dir)
 	free(dir);
 }
 
-int addDirectoryEntry(Disk *d, Inode *inodeDir, unsigned int inodeEntryNumber, const char *entryName)
+int addDirectoryEntry(Disk *d, Inode *inodeDir, Inode *inodeEntry, const char *entryName)
 {
-
 	Directory *dir = loadDirectory(d, inodeDir);
 
 	if (dir == NULL)
 		return -1;
-	DirectoryEntry *entry = malloc(sizeof(DirectoryEntry));
-
-	if (entry == NULL)
-		return -1;
-
 	for (unsigned int i = 0; i < dir->numEntries; i++)
 		if (strcmp(dir->entries[i]->name, entryName) == 0)
+		{
+			freeDirectory(dir);
 			return -1;
-	free(dir);
+		}
 
-	entry->inodeNumber = inodeEntryNumber;
-
+	DirectoryEntry *entry = malloc(sizeof(DirectoryEntry));
+	if (entry == NULL)
+		return -1;
+	entry->inodeNumber = inodeGetNumber(inodeEntry);
 	strncpy(entry->name, entryName, MAX_FILENAME_LENGTH);
 	// save entry
 
@@ -257,7 +257,6 @@ int addDirectoryEntry(Disk *d, Inode *inodeDir, unsigned int inodeEntryNumber, c
 		}
 		if (writeBlock(d, blocks[0], newBlockBuffer) == -1)
 			return -1;
-
 		inodeAddBlock(inodeDir, blocks[0]);
 		setBlocksStatus(1, blocks, 1);
 	}
@@ -266,13 +265,9 @@ int addDirectoryEntry(Disk *d, Inode *inodeDir, unsigned int inodeEntryNumber, c
 		return -1;
 
 	inodeSetFileSize(inodeDir, inodeGetFileSize(inodeDir) + sizeof(DirectoryEntry));
-	Inode *entryInode = inodeLoad(inodeEntryNumber, d);
+	inodeSetRefCount(inodeEntry, inodeGetRefCount(inodeEntry) + 1);
 
-	if (entryInode == NULL)
-		return -1;
-	inodeSetRefCount(entryInode, inodeGetRefCount(entryInode) + 1);
-
-	if (inodeSave(entryInode) == -1 || inodeSave(inodeDir) == -1)
+	if (inodeSave(inodeEntry) == -1 || inodeSave(inodeDir) == -1)
 		return -1;
 	return saveBitmap(d);
 }
@@ -299,7 +294,7 @@ int createDirectory(Disk *d, Inode *inode)
 	setBlocksStatus(1, blocks, 1);
 	saveBitmap(d);
 	free(dir);
-	return addDirectoryEntry(d, inode, inodeGetNumber(inode), ".");
+	return addDirectoryEntry(d, inode, inode, ".");
 }
 
 unsigned int findInodeNumber(Directory *dir, const char *name)
@@ -365,9 +360,8 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	// create root
 	if (createDirectory(d, inodeRoot) == -1)
 		return -1;
-	// if (addDirectoryEntry(d, inodeRoot, ROOT_INODE_NUMBER, "..") == -1)
-	// 	return -1;
-	free(inodeRoot);
+	if (addDirectoryEntry(d, inodeRoot, inodeRoot, "..") == -1)
+		return -1;
 	return superblock[SUPERBLOCK_ITEM_NUMBLOCKS];
 }
 
@@ -416,35 +410,71 @@ int myFSOpen(Disk *d, const char *path)
 
 	if (loadRootInode(d) == -1)
 		return -1;
-	Directory *dir = loadDirectory(d, inodeRoot);
-	if (dir == NULL)
-		return -1;
 
-	Inode *inode = inodeRoot;
-	for (int i = 0; i < numEntries; i++)
+	Inode *inode = NULL;
+	Directory *dir = NULL;
+	char foundDir = 0;
+	for (int i = 0; i < numEntries - 1; i++)
 	{
-		if (inodeGetFileType(inode) != FILETYPE_DIR)
-			return -1;
-		Directory *dir = loadDirectory(d, inode);
+		dir = loadDirectory(d, i == 0 ? inodeRoot : inode);
 		if (dir == NULL)
-			return -1;
+			break;
 		unsigned int inodeNumber = findInodeNumber(dir, entries[i]);
 		freeDirectory(dir);
+		dir = NULL;
+		if (inodeNumber == 0)
+			break;
+		free(inode);
 		inode = inodeLoad(inodeNumber, d);
 		if (inode == NULL)
-			return -1;
+			break;
+		if (i == numEntries - 2)
+			foundDir = 1;
+	}
+	char foundFile = 0;
+	if (foundDir)
+		dir = loadDirectory(d, inode);
+	Inode *inodeFile = NULL;
+	if (dir != NULL)
+	{
+		unsigned int inodeNumber = findInodeNumber(dir, entries[numEntries - 1]);
+		if (inodeNumber != 0)
+		{
+			inodeFile = inodeLoad(inodeNumber, d);
+			if (inodeFile != NULL)
+				foundFile = 1;
+		}
+		else
+		{
+			inodeNumber = inodeFindFreeInode(ROOT_INODE_NUMBER + 1, d);
+			if (inodeNumber != 0)
+			{
+				inodeFile = inodeCreate(inodeNumber, d);
+				if (inode != NULL)
+				{
+					inodeSetFileType(inode, FILETYPE_REGULAR);
+					addDirectoryEntry(d, inode, inodeFile, entries[numEntries - 1]);
+					foundFile = 1;
+				}
+			}
+		}
+	}
+
+	int fd = -1;
+	if (foundFile)
+	{
+		for (unsigned int i = 0; i < numOpenFiles; i++)
+		{
+			if (openFiles[i] == inodeFile)
+			{
+				// File is already open, return its file descriptor
+				free(entries);
+				return i;
+			}
+		}
 	}
 
 	// Check if the file is already open
-	for (unsigned int i = 0; i < numOpenFiles; i++)
-	{
-		if (openFiles[i] == inode)
-		{
-			// File is already open, return its file descriptor
-			free(entries);
-			return i;
-		}
-	}
 
 	// Add the file to the open files array
 	openFiles[numOpenFiles++] = inode;
