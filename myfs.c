@@ -82,7 +82,7 @@ int writeBlock(Disk *d, unsigned int block, const char *buf, unsigned int size)
 		memcpy(sector, &buf[i * DISK_SECTORDATASIZE], sizeToWrite);
 		if (diskWriteSector(d, firstSector + i, sector) == -1)
 			return -1;
-		size -= DISK_SECTORDATASIZE;
+		size -= sizeToWrite;
 	}
 	return 0;
 }
@@ -109,8 +109,7 @@ int saveSuperblock(Disk *d)
 	unsigned char sector[DISK_SECTORDATASIZE];
 	for (int a = 0; a < SUPERBLOCK_SIZE; a++)
 		ul2char(superblock[a], &sector[a * sizeof(unsigned int)]);
-	diskWriteSector(d, SUPERBLOCK_SECTOR, sector);
-	return 0;
+	return diskWriteSector(d, SUPERBLOCK_SECTOR, sector);
 }
 
 int loadSuperblock(Disk *d)
@@ -134,9 +133,12 @@ int loadBitmap(Disk *d)
 	if (bitmap != NULL)
 		return 0;
 	bitmap = calloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS], sizeof(unsigned char));
-	if (bitmap == NULL)
+	unsigned char *buffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE] * sizeof(unsigned char));
+	if (bitmap == NULL || buffer == NULL)
 		return -1;
-	int response = readBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap);
+	int response = readBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], buffer);
+	memcpy(bitmap, buffer, superblock[SUPERBLOCK_ITEM_NUMBLOCKS] * sizeof(unsigned char));
+	free(buffer);
 	return response;
 }
 
@@ -144,16 +146,17 @@ int saveBitmap(Disk *d)
 {
 	if (bitmap == NULL)
 		return -1;
-	if (writeBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap, superblock[SUPERBLOCK_ITEM_NUMBLOCKS]) == -1)
-		return -1;
+	return writeBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap, superblock[SUPERBLOCK_ITEM_NUMBLOCKS] * sizeof(unsigned char));
 }
 
 int findFreeBlocks(unsigned int numBlocks, unsigned int *blocks)
 {
+	if (numBlocks <= 0)
+		return 0;
 	unsigned int freeBlocks = 0;
 	for (unsigned int i = 0; i < superblock[SUPERBLOCK_ITEM_NUMBLOCKS]; i++)
 	{
-		if (!bitmap[i])
+		if (bitmap[i] == 0)
 		{
 			blocks[freeBlocks] = i;
 			freeBlocks++;
