@@ -11,11 +11,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 #include "myfs.h"
 #include "vfs.h"
 #include "inode.h"
 #include "util.h"
+
+unsigned int divideCeil(unsigned int a, unsigned int b)
+{
+	unsigned int result = a / b;
+	if (a % b != 0)
+		result++;
+	return result;
+}
 
 // Declaracoes globais
 #define MAX_PATH_LENGTH 1000
@@ -208,7 +215,7 @@ Directory *loadDirectory(Disk *d, Inode *inode)
 	Directory *dir = malloc(sizeof(Directory));
 	if (dir == NULL)
 		return NULL;
-	unsigned int numBlocks = ceil((float)inodeGetFileSize(inode) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int numBlocks = divideCeil(inodeGetFileSize(inode), superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 	unsigned char *buffer = malloc(numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 	unsigned int bufferOffset = 0;
 	for (unsigned int i = 0; i < numBlocks; i++)
@@ -479,7 +486,7 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	// criar bitmap
 	bitmap = calloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS], sizeof(unsigned char));
 	unsigned int inodesSectors = superblock[SUPERBLOCK_ITEM_NUMINODES] / inodeNumInodesPerSector();
-	unsigned int inodesBlocks = ceil((float)(inodesSectors + inodeAreaBeginSector()) * DISK_SECTORDATASIZE / blockSize);
+	unsigned int inodesBlocks = divideCeil((inodesSectors + inodeAreaBeginSector()) * DISK_SECTORDATASIZE, blockSize);
 	for (int i = 0; i < inodesBlocks + 1; i++)
 		bitmap[i] = 1;
 	superblock[SUPERBLOCK_ITEM_BITMAPBLOCK] = inodesBlocks;
@@ -640,7 +647,7 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	if (openFile == NULL || loadFSData(openFile->disk) == -1)
 		return -1;
 	unsigned int sizeToRead = nbytes > inodeGetFileSize(openFile->inode) ? inodeGetFileSize(openFile->inode) : nbytes;
-	unsigned int numBlocks = ceil((float)sizeToRead / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int numBlocks = divideCeil(sizeToRead, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 	unsigned int offset = 0;
 	unsigned char *blockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 	for (unsigned int i = 0; i < numBlocks; i++)
@@ -703,7 +710,7 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 		}
 		cursorBlock++;
 
-		unsigned int numBlocks = ceil((float)(nbytes - bufferOffset) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+		unsigned int numBlocks = divideCeil((nbytes - bufferOffset), superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 		unsigned int *newBlocks = NULL;
 		unsigned int newBlocksOffset = 0;
 		for (unsigned int i = 0; i < numBlocks; i++)
@@ -722,7 +729,7 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 			{
 				if (newBlocks == NULL)
 				{
-					unsigned int numNewBlocks = ceil((float)(nbytes - bufferOffset) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+					unsigned int numNewBlocks = divideCeil((nbytes - bufferOffset), superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 					newBlocks = malloc(numNewBlocks * sizeof(unsigned int));
 					if (newBlocks == NULL || findFreeBlocks(numNewBlocks, newBlocks) == -1)
 						break;
