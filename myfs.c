@@ -1,7 +1,7 @@
 /*
  *  myfs.c - Implementacao do sistema de arquivos MyFS
  *
- *  Autores: SUPER_PROGRAMADORES_C
+ *  Autores: Willian Cesar de Sena Melo (Nº UFJF: 202035010)
  *  Projeto: Trabalho Pratico II - Sistemas Operacionais
  *  Organizacao: Universidade Federal de Juiz de Fora
  *  Departamento: Dep. Ciencia da Computacao
