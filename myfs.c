@@ -22,7 +22,7 @@
 #define NUMBLOCKS_PERINODE 8
 
 #define ROOT_INODE_NUMBER 1
-Inode *inodeRoot;
+Inode *inodeRoot = NULL;
 int loadRootInode(Disk *d)
 {
 	if (inodeRoot != NULL)
@@ -44,9 +44,9 @@ unsigned int *superblock = NULL;
 
 // bitmap
 #define BITMAP_SECTOR 1
-char *bitmap = NULL; // tamanho = numero de blocos | 1 = ocupado, 0 = livre
+unsigned char *bitmap = NULL; // tamanho = numero de blocos | 1 = ocupado, 0 = livre
 
-#define MAX_OPEN_FILES 20
+#define MAX_OPEN_FILES MAX_FDS
 typedef struct fileDescriptor
 {
 	unsigned int fd;
@@ -57,6 +57,15 @@ typedef struct fileDescriptor
 FileDescriptor *openFiles[MAX_OPEN_FILES];
 unsigned int numOpenFiles = 0;
 unsigned int lastFd = 0;
+
+unsigned int inodeGetLastBlockAddr(Inode *inode)
+{
+	unsigned int totalSize = inodeGetFileSize(inode);
+	unsigned int lastBlock = totalSize / superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+	if (totalSize % superblock[SUPERBLOCK_ITEM_BLOCKSIZE] == 0)
+		lastBlock--;
+	return inodeGetBlockAddr(inode, lastBlock);
+}
 
 int writeBlock(Disk *d, unsigned int block, const char *buf, unsigned int size)
 {
@@ -127,20 +136,16 @@ int loadBitmap(Disk *d)
 	bitmap = calloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS], sizeof(unsigned char));
 	if (bitmap == NULL)
 		return -1;
-	return readBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap);
+	int response = readBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap);
+	return response;
 }
 
 int saveBitmap(Disk *d)
 {
-	const unsigned int firstSector = superblock[SUPERBLOCK_ITEM_BITMAPBLOCK] * superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
-	const unsigned int numSectors = sizeof(unsigned char) * superblock[SUPERBLOCK_ITEM_NUMBLOCKS] / DISK_SECTORDATASIZE;
-	for (int i = 0; i < numSectors; i++)
-	{
-		unsigned char sector[DISK_SECTORDATASIZE];
-		memcpy(sector, &bitmap[i * DISK_SECTORDATASIZE], DISK_SECTORDATASIZE);
-		if (diskWriteSector(d, firstSector + i, sector) == -1)
-			return -1;
-	}
+	if (bitmap == NULL)
+		return -1;
+	if (writeBlock(d, superblock[SUPERBLOCK_ITEM_BITMAPBLOCK], bitmap, superblock[SUPERBLOCK_ITEM_NUMBLOCKS]) == -1)
+		return -1;
 }
 
 int findFreeBlocks(unsigned int numBlocks, unsigned int *blocks)
@@ -181,155 +186,209 @@ typedef struct directory
 	unsigned int numEntries;
 } Directory;
 
-Directory *loadDirectory(Disk *d, Inode *inode)
-{
-	if (inodeGetFileType(inode) != FILETYPE_DIR)
-		return NULL;
-	Directory *dir = malloc(sizeof(Directory));
-	if (dir == NULL)
-		return NULL;
-	unsigned int numBlocks = ceil((float)inodeGetFileSize(inode) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
-	unsigned char *buffer = malloc(numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-	for (unsigned int i = 0; i < numBlocks; i++)
-	{
-		unsigned int block = inodeGetBlockAddr(inode, i);
-		unsigned int firstSector = block * sectorPerBlock;
-		for (unsigned int j = 0; j < sectorPerBlock; j++)
-		{
-			if (diskReadSector(d, firstSector + j, &buffer[j * DISK_SECTORDATASIZE + i * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]]) == -1)
-				return NULL;
-		}
-	}
-	char2ul(&buffer[0], &(dir->numEntries));
-	unsigned int offset = sizeof(unsigned int);
-	if (dir->numEntries > 0)
-	{
-		dir->entries = malloc(dir->numEntries * sizeof(DirectoryEntry *));
-		for (unsigned int i = 0; i < dir->numEntries; i++)
-		{
-			dir->entries[i] = malloc(sizeof(DirectoryEntry));
-			char2ul(&buffer[offset], &(dir->entries[i]->inodeNumber));
-			offset += sizeof(unsigned int);
-			memcpy(&buffer[offset], dir->entries[i]->name, MAX_FILENAME_LENGTH);
-			offset += MAX_FILENAME_LENGTH;
-		}
-	}
-	else
-	{
-		dir->entries = NULL;
-	}
-	free(buffer);
-	return dir;
-}
-
 void freeDirectory(Directory *dir)
 {
 	if (dir == NULL)
 		return;
-	for (unsigned int i = 0; i < dir->numEntries; i++)
-		free(dir->entries[i]);
+	if (dir->entries != NULL)
+		for (unsigned int i = 0; i < dir->numEntries; i++)
+			free(dir->entries[i]);
 	free(dir->entries);
 	free(dir);
+}
+
+Directory *loadDirectory(Disk *d, Inode *inode)
+{
+	if (inodeGetFileType(inode) != FILETYPE_DIR)
+		return NULL;
+	Directory *responseDir;
+	Directory *dir = malloc(sizeof(Directory));
+	if (dir == NULL)
+		return NULL;
+	unsigned int numBlocks = ceil((float)inodeGetFileSize(inode) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned char *buffer = malloc(numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+	unsigned int bufferOffset = 0;
+	for (unsigned int i = 0; i < numBlocks; i++)
+	{
+		if (readBlock(d, inodeGetBlockAddr(inode, i), &buffer[bufferOffset]) == -1)
+			break;
+		bufferOffset += superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+	}
+	if (bufferOffset == numBlocks * superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
+	{
+		bufferOffset = 0;
+		char2ul(buffer, &(dir->numEntries));
+		bufferOffset += sizeof(unsigned int);
+		if (dir->numEntries > 0)
+			dir->entries = malloc(dir->numEntries * sizeof(DirectoryEntry *));
+		else
+		{
+			dir->entries = NULL;
+			responseDir = dir; // response dir != NULL > SUCCESS
+		}
+		if (dir->entries != NULL)
+		{
+			for (unsigned int i = 0; i < dir->numEntries; i++)
+			{
+				dir->entries[i] = malloc(sizeof(DirectoryEntry));
+				if (dir->entries[i] == NULL)
+					break;
+				char2ul(&buffer[bufferOffset], &(dir->entries[i]->inodeNumber));
+				bufferOffset += sizeof(unsigned int);
+				memcpy(dir->entries[i]->name, &buffer[bufferOffset], MAX_FILENAME_LENGTH * sizeof(char));
+				bufferOffset += MAX_FILENAME_LENGTH * sizeof(char);
+			}
+
+			if (bufferOffset == inodeGetFileSize(inode))
+				responseDir = dir;
+		}
+	}
+
+	free(buffer);
+	if (responseDir == NULL)
+		freeDirectory(dir);
+	return responseDir;
+}
+
+int setDirNumEntries(Disk *d, unsigned int firstBlock, unsigned int numEntries)
+{
+	unsigned int firstSector = firstBlock * superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
+	unsigned char sector[DISK_SECTORDATASIZE];
+	if (diskReadSector(d, firstSector, sector) == -1)
+		return -1;
+	ul2char(numEntries, sector);
+	if (diskWriteSector(d, firstSector, sector) == -1)
+		return -1;
 }
 
 int addDirectoryEntry(Disk *d, Inode *inodeDir, Inode *inodeEntry, const char *entryName)
 {
 	Directory *dir = loadDirectory(d, inodeDir);
-
 	if (dir == NULL)
 		return -1;
 	for (unsigned int i = 0; i < dir->numEntries; i++)
+	{
 		if (strcmp(dir->entries[i]->name, entryName) == 0)
 		{
 			freeDirectory(dir);
 			return -1;
 		}
+	}
 
 	DirectoryEntry *entry = malloc(sizeof(DirectoryEntry));
 	if (entry == NULL)
+	{
+		freeDirectory(dir);
 		return -1;
+	}
 	entry->inodeNumber = inodeGetNumber(inodeEntry);
 	strncpy(entry->name, entryName, MAX_FILENAME_LENGTH);
 
-	unsigned char toSaveBuffer[sizeof(DirectoryEntry)];
+	const size_t entrySize = sizeof(unsigned int) + MAX_FILENAME_LENGTH * sizeof(char);
+	unsigned char toSaveBuffer[entrySize];
 	ul2char(entry->inodeNumber, toSaveBuffer);
-	memcpy(&toSaveBuffer[sizeof(unsigned int)], entry->name, MAX_FILENAME_LENGTH);
+	memcpy(&toSaveBuffer[sizeof(unsigned int)], entry->name, MAX_FILENAME_LENGTH * sizeof(char));
 	free(entry);
 
-	unsigned int finalBlock = inodeGetBlockAddr(inodeDir, inodeGetFileSize(inodeDir) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-	unsigned char finalBlockBuffer[superblock[SUPERBLOCK_ITEM_BLOCKSIZE]];
+	unsigned int finalBlock = inodeGetLastBlockAddr(inodeDir);
+	unsigned int finalBlockOffset = inodeGetFileSize(inodeDir) % superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+	unsigned int finalBlockFreeSpace = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] - finalBlockOffset;
+	unsigned char *finalBlockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 
 	if (readBlock(d, finalBlock, finalBlockBuffer) == -1)
+	{
+		freeDirectory(dir);
+		free(finalBlockBuffer);
 		return -1;
+	}
 
-	unsigned int finalBlockFreeSpace = inodeGetFileSize(inodeDir) % superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
-
-	unsigned int offset = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] - finalBlockFreeSpace;
-
-	if (finalBlockFreeSpace > sizeof(DirectoryEntry))
-		memcpy(&finalBlockBuffer[offset], toSaveBuffer, sizeof(DirectoryEntry));
+	unsigned int newBlock = 0;
+	unsigned char *newBlockBuffer = NULL;
+	if (finalBlockFreeSpace >= entrySize)
+		memcpy(&finalBlockBuffer[finalBlockOffset], toSaveBuffer, entrySize);
 	else
 	{
 		unsigned int blocks[1];
 		if (findFreeBlocks(1, blocks) == -1)
-			return -1;
-		unsigned char newBlockBuffer[superblock[SUPERBLOCK_ITEM_BLOCKSIZE]];
-		for (unsigned int i = 0; i < sizeof(DirectoryEntry); i++)
 		{
-			if (offset >= superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
-				newBlockBuffer[offset - superblock[SUPERBLOCK_ITEM_BLOCKSIZE]] = toSaveBuffer[i];
-			else
-				finalBlockBuffer[offset] = toSaveBuffer[i];
-			offset++;
-		}
-		if (writeBlock(d, blocks[0], newBlockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
+			freeDirectory(dir);
+			free(finalBlockBuffer);
 			return -1;
-		inodeAddBlock(inodeDir, blocks[0]);
-		setBlocksStatus(1, blocks, 1);
+		}
+		newBlock = blocks[0];
+		newBlockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
+		for (unsigned int i = 0; i < entrySize; i++)
+		{
+			if (finalBlockOffset >= superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
+				newBlockBuffer[finalBlockOffset - superblock[SUPERBLOCK_ITEM_BLOCKSIZE]] = toSaveBuffer[i];
+			else
+				finalBlockBuffer[finalBlockOffset] = toSaveBuffer[i];
+			finalBlockOffset++;
+		}
 	}
 
 	if (writeBlock(d, finalBlock, finalBlockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
+	{
+		freeDirectory(dir);
+		free(finalBlockBuffer);
+		free(newBlockBuffer);
 		return -1;
+	}
+	if (newBlockBuffer != NULL && writeBlock(d, newBlock, newBlockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
+	{
+		freeDirectory(dir);
+		free(finalBlockBuffer);
+		free(newBlockBuffer);
+		return -1;
+	}
 
-	inodeSetFileSize(inodeDir, inodeGetFileSize(inodeDir) + sizeof(DirectoryEntry));
+	if (newBlock != 0)
+		inodeAddBlock(inodeDir, newBlock);
+	inodeSetFileSize(inodeDir, inodeGetFileSize(inodeDir) + entrySize);
 	inodeSetRefCount(inodeEntry, inodeGetRefCount(inodeEntry) + 1);
 
-	if (inodeSave(inodeEntry) == -1 || inodeSave(inodeDir) == -1)
+	free(newBlockBuffer);
+	free(finalBlockBuffer);
+	unsigned int newNumEntries = dir->numEntries + 1;
+	freeDirectory(dir);
+
+	if (inodeSave(inodeEntry) == -1 || inodeSave(inodeDir) == -1 || saveBitmap(d) == -1)
 		return -1;
-	return saveBitmap(d);
+	return setDirNumEntries(d, inodeGetBlockAddr(inodeDir, 0), newNumEntries);
 }
 
 int createDirectory(Disk *d, Inode *inode)
 {
-	Directory *dir = malloc(sizeof(Directory));
-	if (dir == NULL)
-		return -1;
-	dir->numEntries = 0;
-	dir->entries = NULL;
+	unsigned int numEntries = 0;
 	unsigned int blocks[1];
-	if (findFreeBlocks(1, blocks) == -1)
-		return -1;
-	unsigned char sector[DISK_SECTORDATASIZE];
-	ul2char(dir->numEntries, sector);
-	unsigned int sectorPerBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] / DISK_SECTORDATASIZE;
-	if (diskWriteSector(d, blocks[0] * sectorPerBlock, sector) == -1)
-		return -1;
-	inodeSetFileSize(inode, sizeof(unsigned int));
-	inodeSetFileType(inode, FILETYPE_DIR);
-	inodeSetRefCount(inode, 1);
-	inodeAddBlock(inode, blocks[0]);
-	setBlocksStatus(1, blocks, 1);
-	saveBitmap(d);
-	free(dir);
-	return addDirectoryEntry(d, inode, inode, ".");
+	if (findFreeBlocks(1, blocks) == 0)
+	{
+		unsigned char buf[sizeof(unsigned int)];
+		ul2char(numEntries, buf);
+		if (writeBlock(d, blocks[0], buf, sizeof(unsigned int)) == 0)
+		{
+			inodeSetFileSize(inode, sizeof(unsigned int));
+			inodeSetFileType(inode, FILETYPE_DIR);
+			inodeSetGroupOwner(inode, 0);
+			inodeSetOwner(inode, 0);
+			inodeSetPermission(inode, 0);
+			inodeAddBlock(inode, blocks[0]);
+			setBlocksStatus(1, blocks, 1);
+			saveBitmap(d);
+			return addDirectoryEntry(d, inode, inode, ".");
+		}
+	}
+	return -1;
 }
 
 unsigned int findInodeNumber(Directory *dir, const char *name)
 {
 	for (unsigned int i = 0; i < dir->numEntries; i++)
+	{
 		if (strcmp(dir->entries[i]->name, name) == 0)
 			return dir->entries[i]->inodeNumber;
+	}
+
 	return 0;
 }
 
@@ -351,15 +410,26 @@ FileDescriptor *createFileDescriptor(Disk *d, Inode *inode)
 
 FileDescriptor *getFileDescriptor(unsigned int fd)
 {
+	if (numOpenFiles == 0)
+		return NULL;
 	for (unsigned int i = 0; i < numOpenFiles; i++)
+	{
 		if (openFiles[i]->fd == fd)
 			return openFiles[i];
+	}
+
 	return NULL;
 }
 
 int loadFSData(Disk *d)
 {
-	if (loadSuperblock(d) == -1 || loadRootInode(d) == -1 || loadBitmap(d) == -1)
+	if (d == NULL)
+		return -1;
+	if (loadSuperblock(d) == -1)
+		return -1;
+	if (loadBitmap(d) == -1)
+		return -1;
+	if (loadRootInode(d) == -1)
 		return -1;
 	return 0;
 }
@@ -406,7 +476,7 @@ int myFSFormat(Disk *d, unsigned int blockSize)
 	// criar bitmap
 	bitmap = calloc(superblock[SUPERBLOCK_ITEM_NUMBLOCKS], sizeof(unsigned char));
 	unsigned int inodesSectors = superblock[SUPERBLOCK_ITEM_NUMINODES] / inodeNumInodesPerSector();
-	unsigned int inodesBlocks = (inodesSectors + inodeAreaBeginSector()) * DISK_SECTORDATASIZE / blockSize;
+	unsigned int inodesBlocks = ceil((float)(inodesSectors + inodeAreaBeginSector()) * DISK_SECTORDATASIZE / blockSize);
 	for (int i = 0; i < inodesBlocks + 1; i++)
 		bitmap[i] = 1;
 	superblock[SUPERBLOCK_ITEM_BITMAPBLOCK] = inodesBlocks;
@@ -460,42 +530,35 @@ int myFSOpen(Disk *d, const char *path)
 {
 	if (loadFSData(d) == -1)
 		return -1;
-	if (numOpenFiles >= MAX_OPEN_FILES)
-		return -1;
-	char **entries;
+	char **entries = NULL;
 	int numEntries = splitPath(path, &entries);
+
 	if (numEntries == -1)
 		return -1;
 
-	if (loadRootInode(d) == -1)
-		return -1;
-
-	Inode *inode;
-	Directory *dir;
-	char foundDir = 0;
+	Inode *inodeDir = inodeRoot;
+	Directory *dir = loadDirectory(d, inodeRoot);
 	for (int i = 0; i < numEntries - 1; i++)
 	{
-		dir = loadDirectory(d, i == 0 ? inodeRoot : inode);
-		if (dir == NULL)
-			break;
 		unsigned int inodeNumber = findInodeNumber(dir, entries[i]);
-		freeDirectory(dir);
-		dir = NULL;
 		if (inodeNumber == 0)
 			break;
-		free(inode);
-		inode = inodeLoad(inodeNumber, d);
-		if (inode == NULL)
+		if (inodeDir != inodeRoot)
+			free(inodeDir);
+		inodeDir = inodeLoad(inodeNumber, d);
+		if (inodeDir == NULL || inodeGetFileType(inodeDir) != FILETYPE_DIR)
 			break;
-		if (i == numEntries - 2)
-			foundDir = 1;
+		freeDirectory(dir);
+		dir = loadDirectory(d, inodeDir);
+		if (dir == NULL)
+			break;
 	}
-	Inode *inodeFile = NULL;
-	if (foundDir)
-		dir = loadDirectory(d, inode);
+	Inode *inodeFile;
+
 	if (dir != NULL)
 	{
 		unsigned int inodeNumber = findInodeNumber(dir, entries[numEntries - 1]);
+		freeDirectory(dir);
 		if (inodeNumber != 0)
 			inodeFile = inodeLoad(inodeNumber, d);
 		else
@@ -503,11 +566,31 @@ int myFSOpen(Disk *d, const char *path)
 			inodeNumber = inodeFindFreeInode(ROOT_INODE_NUMBER + 1, d);
 			if (inodeNumber != 0)
 			{
-				inodeFile = inodeCreate(inodeNumber, d);
+				inodeFile = inodeLoad(inodeNumber, d);
 				if (inodeFile != NULL)
 				{
-					inodeSetFileType(inode, FILETYPE_REGULAR);
-					addDirectoryEntry(d, inode, inodeFile, entries[numEntries - 1]);
+					inodeSetFileType(inodeFile, FILETYPE_REGULAR);
+					inodeSetFileSize(inodeFile, 0);
+					inodeSetGroupOwner(inodeFile, 0);
+					inodeSetOwner(inodeFile, 0);
+					inodeSetPermission(inodeFile, 0);
+					unsigned int blocks[1];
+					if (findFreeBlocks(1, blocks) == -1)
+					{
+						free(inodeFile);
+						inodeFile = NULL;
+					}
+					else
+					{
+						inodeAddBlock(inodeFile, blocks[0]);
+						setBlocksStatus(1, blocks, 1);
+						saveBitmap(d);
+					}
+					if (inodeFile != NULL && addDirectoryEntry(d, inodeDir, inodeFile, entries[numEntries - 1]) == -1)
+					{
+						free(inodeFile);
+						inodeFile = NULL;
+					}
 				}
 			}
 		}
@@ -524,14 +607,24 @@ int myFSOpen(Disk *d, const char *path)
 				break;
 			}
 		}
-		if (!fd)
+		if (fd == 0)
 		{
 			FileDescriptor *newFileDescriptor = createFileDescriptor(d, inodeFile);
 			if (newFileDescriptor != NULL)
 				fd = newFileDescriptor->fd;
 		}
-		return fd;
 	}
+
+	if (entries != NULL)
+	{
+		for (int i = 0; i < numEntries; i++)
+			free(entries[i]);
+		free(entries);
+	}
+	if (inodeDir != NULL && inodeDir != inodeRoot)
+		free(inodeDir);
+
+	return fd;
 }
 
 // Funcao para a leitura de um arquivo, a partir de um descritor de
@@ -543,25 +636,24 @@ int myFSRead(int fd, char *buf, unsigned int nbytes)
 	FileDescriptor *openFile = getFileDescriptor(fd);
 	if (openFile == NULL || loadFSData(openFile->disk) == -1)
 		return -1;
-
 	unsigned int sizeToRead = nbytes > inodeGetFileSize(openFile->inode) ? inodeGetFileSize(openFile->inode) : nbytes;
 	unsigned int numBlocks = ceil((float)sizeToRead / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 	unsigned int offset = 0;
 	unsigned char *blockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
 	for (unsigned int i = 0; i < numBlocks; i++)
 	{
-		if (i + 1 >= numBlocks)
-		{
-			if (readBlock(openFile->disk, inodeGetBlockAddr(openFile->inode, i), &buf[offset]) == -1)
-				break;
-			offset += superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
-		}
-		else
+		if (i + 1 == numBlocks)
 		{
 			if (readBlock(openFile->disk, inodeGetBlockAddr(openFile->inode, i), blockBuffer) == -1)
 				break;
 			memcpy(&buf[offset], blockBuffer, sizeToRead - offset);
 			offset += sizeToRead - offset;
+		}
+		else
+		{
+			if (readBlock(openFile->disk, inodeGetBlockAddr(openFile->inode, i), &buf[offset]) == -1)
+				break;
+			offset += superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
 		}
 	}
 	free(blockBuffer);
@@ -582,23 +674,26 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 
 	unsigned int bufferOffset = 0;
 	unsigned int cursorBlock = openFile->cursor / superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+	unsigned int cursorBlockOffset = openFile->cursor % superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
 	unsigned char *blockBuffer = malloc(superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-	unsigned int block = inodeGetBlockAddr(openFile->inode, cursorBlock);
-	if (block)
+	unsigned int blockAddr = inodeGetBlockAddr(openFile->inode, cursorBlock);
+	unsigned int sizeToWriteInCursorBlock = superblock[SUPERBLOCK_ITEM_BLOCKSIZE] - cursorBlockOffset;
+	if (sizeToWriteInCursorBlock > nbytes)
+		sizeToWriteInCursorBlock = nbytes;
+	if (blockAddr != 0)
 	{
-		unsigned int cursorBlockOffset = openFile->cursor % superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
-		if (readBlock(openFile->disk, block, blockBuffer) == -1)
+		if (readBlock(openFile->disk, blockAddr, blockBuffer) == -1)
 		{
 			free(blockBuffer);
 			return -1;
 		}
-		for (unsigned int i = 0; i < superblock[SUPERBLOCK_ITEM_BLOCKSIZE] - cursorBlockOffset; i++)
+		for (unsigned int i = 0; i < sizeToWriteInCursorBlock; i++)
 		{
 			blockBuffer[cursorBlockOffset] = buf[bufferOffset];
 			bufferOffset++;
 			cursorBlockOffset++;
 		}
-		if (writeBlock(openFile->disk, block, blockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
+		if (writeBlock(openFile->disk, blockAddr, blockBuffer, superblock[SUPERBLOCK_ITEM_BLOCKSIZE]) == -1)
 		{
 			free(blockBuffer);
 			return -1;
@@ -606,17 +701,17 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 		cursorBlock++;
 
 		unsigned int numBlocks = ceil((float)(nbytes - bufferOffset) / superblock[SUPERBLOCK_ITEM_BLOCKSIZE]);
-		unsigned int *newBlocks;
+		unsigned int *newBlocks = NULL;
 		unsigned int newBlocksOffset = 0;
 		for (unsigned int i = 0; i < numBlocks; i++)
 		{
-			unsigned int sizeToWrite = superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
-			if (nbytes - bufferOffset < superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
-				sizeToWrite = nbytes - bufferOffset;
-			block = inodeGetBlockAddr(openFile->inode, cursorBlock);
-			if (block)
+			unsigned int sizeToWrite = nbytes - bufferOffset;
+			if (sizeToWrite > superblock[SUPERBLOCK_ITEM_BLOCKSIZE])
+				sizeToWrite = superblock[SUPERBLOCK_ITEM_BLOCKSIZE];
+			blockAddr = inodeGetBlockAddr(openFile->inode, cursorBlock);
+			if (blockAddr != 0)
 			{
-				if (writeBlock(openFile->disk, block, &buf[bufferOffset], sizeToWrite) == -1)
+				if (writeBlock(openFile->disk, blockAddr, &buf[bufferOffset], sizeToWrite) == -1)
 					break;
 				bufferOffset += sizeToWrite;
 			}
@@ -654,14 +749,11 @@ int myFSWrite(int fd, const char *buf, unsigned int nbytes)
 // existente. Retorna 0 caso bem sucedido, ou -1 caso contrario
 int myFSClose(int fd)
 {
-	FileDescriptor *fileToRemove;
+	FileDescriptor *fileToRemove = NULL;
 	for (int i = 0; i < numOpenFiles; i++)
 	{
 		if (openFiles[i]->fd == fd)
-		{
 			fileToRemove = openFiles[i];
-			break;
-		}
 		if (fileToRemove != NULL)
 			openFiles[i] = openFiles[i + 1];
 	}
